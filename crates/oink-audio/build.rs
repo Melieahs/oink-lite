@@ -82,7 +82,6 @@ fn main() {
     }
 }
 
-
 /// True when the selected macOS SDK ships the 14.2 Core Audio process-tap API.
 fn tap_headers_available() -> bool {
     use std::io::Write;
@@ -101,9 +100,8 @@ fn tap_headers_available() -> bool {
         return false;
     };
     if let Some(mut stdin) = child.stdin.take() {
-        let _ = stdin.write_all(
-            b"#include <CoreAudio/AudioHardwareTapping.h>\n#include <CoreAudio/CATapDescription.h>\n",
-        );
+        let _ =
+            stdin.write_all(b"#include <CoreAudio/AudioHardwareTapping.h>\n#include <CoreAudio/CATapDescription.h>\n");
     }
     child.wait().map(|status| status.success()).unwrap_or(false)
 }
