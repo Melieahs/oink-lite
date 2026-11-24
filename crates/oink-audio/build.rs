@@ -53,7 +53,7 @@ fn main() {
             .flag("-std=c11")
             // Compile with weak references to process-tap entry points. The
             // bridge checks availability before calling them at runtime.
-            .flag(&format!("-mmacosx-version-min={minimum}"))
+            .flag(format!("-mmacosx-version-min={minimum}"))
             .warnings(true)
             .compile("oink_audio_capture");
         // Rust links with -nodefaultlibs, so Clang cannot automatically add
@@ -85,9 +85,9 @@ fn main() {
 /// True when the selected macOS SDK ships the 14.2 Core Audio process-tap API.
 fn tap_headers_available() -> bool {
     use std::io::Write;
-    use std::process::{Command, Stdio};
+    use std::process::Stdio;
 
-    let mut probe = cc::Build::new();
+    let probe = cc::Build::new();
     let Ok(mut child) = probe
         .get_compiler()
         .to_command()
