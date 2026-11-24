@@ -1,0 +1,52 @@
+name: catalina-agent
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-15-intel
+    timeout-minutes: 120
+    env:
+      MACOSX_DEPLOYMENT_TARGET: "10.15"
+      CARGO_TERM_COLOR: always
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Environment
+        run: |
+          sw_vers
+          xcodebuild -version
+          rustc -vV
+          cmake --version | head -1 || brew install cmake
+
+      - name: Build agent (process-tap path)
+        run: cargo build -p oink-agent --release
+
+      - name: Verify deployment target and load commands
+        run: |
+          BIN=target/release/oink-agent
+          file "$BIN"
+          otool -l "$BIN" | grep -A4 LC_BUILD_VERSION | head -12
+          echo "--- linked frameworks ---"
+          otool -L "$BIN"
+          codesign --force --sign - "$BIN"
+          mkdir -p dist
+          cp "$BIN" dist/oink-agent
+
+      - name: Build agent (audio-disabled fallback)
+        env:
+          OINK_AUDIO_DISABLED: "1"
+        run: |
+          cargo build -p oink-agent --release
+          codesign --force --sign - target/release/oink-agent
+          cp target/release/oink-agent dist/oink-agent-no-audio
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: oink-agent-catalina-x86_64
+          path: dist/
+          if-no-files-found: error
