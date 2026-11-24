@@ -1,5 +1,7 @@
 # audiopus_sys 0.2 bundles Opus's older CMake project. Required by CMake >=4.
 [env]
 CMAKE_POLICY_VERSION_MINIMUM = "3.5"
-# Keep native dependencies compatible with the macOS 14.2 API baseline.
-MACOSX_DEPLOYMENT_TARGET = "14.2"
+# Catalina fork: the agent must load on macOS 10.15. Audio capture is
+# unavailable there (Core Audio process taps are 14.2+), but keyboard and
+# mouse sharing only needs older AppKit/CoreGraphics APIs.
+MACOSX_DEPLOYMENT_TARGET = "10.15"
