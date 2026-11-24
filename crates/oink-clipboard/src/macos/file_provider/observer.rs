@@ -8,22 +8,53 @@ use objc2::{
     runtime::{AnyClass, AnyObject, Bool, ProtocolObject},
 };
 use objc2_foundation::{NSArray, NSError, NSNotification, NSNotificationCenter, NSObjectProtocol, NSString};
+use std::ffi::{CStr, c_char, c_int, c_void};
 use std::ptr::NonNull;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use tokio::sync::watch;
 
 type Status = Result<Option<DomainStatus>, String>;
 
-#[link(name = "FileProvider", kind = "framework")]
+const FILE_PROVIDER_PATH: &CStr = c"/System/Library/Frameworks/FileProvider.framework/FileProvider";
+const RTLD_LAZY: c_int = 0x1;
+const RTLD_LOCAL: c_int = 0x4;
+
+#[link(name = "System")]
 unsafe extern "C" {
-    static NSFileProviderDomainDidChange: &'static NSString;
-    static NSFileProviderMaterializedSetDidChange: &'static NSString;
+    fn dlopen(path: *const c_char, mode: c_int) -> *mut c_void;
+    fn dlsym(handle: *mut c_void, symbol: *const c_char) -> *mut c_void;
+}
+
+fn file_provider_handle() -> Option<*mut c_void> {
+    static HANDLE: OnceLock<usize> = OnceLock::new();
+    // SAFETY: dlopen only loads a system framework; the handle stays valid for
+    // the process lifetime and loading it only registers its Objective-C
+    // classes.
+    let raw = *HANDLE.get_or_init(|| unsafe { dlopen(FILE_PROVIDER_PATH.as_ptr(), RTLD_LAZY | RTLD_LOCAL) as usize });
+    (raw != 0).then_some(raw as *mut c_void)
+}
+
+/// Reads a `static NSString *` exported by FileProvider. The notification
+/// constants used here appeared in macOS 11, so they are resolved at runtime
+/// instead of at launch: a strong import would abort the process on 10.15.
+fn notification_name(symbol: &CStr) -> Option<&'static NSString> {
+    let handle = file_provider_handle()?;
+    // SAFETY: `symbol` names a process-lifetime `NSString *` constant in the
+    // loaded framework, and a missing symbol yields a null pointer.
+    unsafe {
+        let pointer = dlsym(handle, symbol.as_ptr());
+        if pointer.is_null() {
+            return None;
+        }
+        let value = *pointer.cast::<*const NSString>();
+        NonNull::new(value.cast_mut()).map(|value| value.as_ref())
+    }
 }
 
 #[derive(Debug)]
 pub struct Observer {
-    cache_token: Retained<ProtocolObject<dyn NSObjectProtocol>>,
-    token: Retained<ProtocolObject<dyn NSObjectProtocol>>,
+    cache_token: Option<Retained<ProtocolObject<dyn NSObjectProtocol>>>,
+    token: Option<Retained<ProtocolObject<dyn NSObjectProtocol>>>,
     receiver: watch::Receiver<Option<Status>>,
     sender: watch::Sender<Option<Status>>,
     generation: Arc<Mutex<u64>>,
@@ -40,32 +71,35 @@ impl Observer {
         let generation = Arc::new(Mutex::new(0));
         let notices = generation.clone();
         let block = RcBlock::new(move |_: NonNull<NSNotification>| read_domains(changes.clone(), notices.clone()));
+        let domain_name = notification_name(c"NSFileProviderDomainDidChange");
         // SAFETY: framework-provided notification name, no queue affinity; the
         // block captures only a sendable watch sender. Register before the read
-        // that enables domain notifications so changes cannot be missed.
-        let token = unsafe {
+        // that enables domain notifications so changes cannot be missed. A
+        // system without the notification simply installs no observer.
+        let token = domain_name.map(|name| unsafe {
             NSNotificationCenter::defaultCenter().addObserverForName_object_queue_usingBlock(
-                Some(NSFileProviderDomainDidChange),
+                Some(name),
                 None,
                 None,
                 &block,
             )
-        };
+        });
         let cache_block = RcBlock::new(move |_: NonNull<NSNotification>| {
             if let Some(root) = super::CONTAINER.get() {
                 crate::cache::changed(root);
             }
         });
+        let materialized_name = notification_name(c"NSFileProviderMaterializedSetDidChange");
         // SAFETY: framework-provided notification name; the block only accesses
         // thread-safe cache state and has no queue affinity. The center copies it.
-        let cache_token = unsafe {
+        let cache_token = materialized_name.map(|name| unsafe {
             NSNotificationCenter::defaultCenter().addObserverForName_object_queue_usingBlock(
-                Some(NSFileProviderMaterializedSetDidChange),
+                Some(name),
                 None,
                 None,
                 &cache_block,
             )
-        };
+        });
         read_domains(sender.clone(), generation.clone());
         Self {
             cache_token,
@@ -102,9 +136,14 @@ impl Drop for Observer {
     fn drop(&mut self) {
         // SAFETY: token was returned by this notification center. In-flight
         // callbacks retain their sender and never borrow the Observer.
+        let center = NSNotificationCenter::defaultCenter();
         unsafe {
-            NSNotificationCenter::defaultCenter().removeObserver(AsRef::<AnyObject>::as_ref(&*self.token));
-            NSNotificationCenter::defaultCenter().removeObserver(AsRef::<AnyObject>::as_ref(&*self.cache_token));
+            if let Some(token) = &self.token {
+                center.removeObserver(AsRef::<AnyObject>::as_ref(&**token));
+            }
+            if let Some(token) = &self.cache_token {
+                center.removeObserver(AsRef::<AnyObject>::as_ref(&**token));
+            }
         }
     }
 }
