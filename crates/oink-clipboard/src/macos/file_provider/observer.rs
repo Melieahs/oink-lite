@@ -25,6 +25,41 @@ unsafe extern "C" {
     fn dlsym(handle: *mut c_void, symbol: *const c_char) -> *mut c_void;
 }
 
+/// File Provider's manager forwards `getDomains…` over NSXPCConnection, whose
+/// Catalina implementation rejects blocks that lack extended signature type
+/// information (the block API used here cannot supply it) and throws. Domain
+/// observation is a macOS 11 feature, so skip the query entirely before then.
+fn system_supports_file_provider() -> bool {
+    static SUPPORTED: OnceLock<bool> = OnceLock::new();
+    *SUPPORTED.get_or_init(|| {
+        let mut bytes = [0u8; 32];
+        let mut size = bytes.len();
+        // SAFETY: read-only sysctl into the supplied buffer; its size is in/out.
+        let rc = unsafe {
+            libc::sysctlbyname(
+                c"kern.osproductversion".as_ptr(),
+                bytes.as_mut_ptr().cast(),
+                &mut size,
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        if rc != 0 {
+            return false;
+        }
+        let Ok(version) = CStr::from_bytes_until_nul(&bytes) else {
+            return false;
+        };
+        let major = version
+            .to_string_lossy()
+            .split('.')
+            .next()
+            .and_then(|part| part.parse::<u64>().ok())
+            .unwrap_or(0);
+        major >= 11
+    })
+}
+
 fn file_provider_handle() -> Option<*mut c_void> {
     static HANDLE: OnceLock<usize> = OnceLock::new();
     // SAFETY: dlopen only loads a system framework; the handle stays valid for
@@ -71,7 +106,10 @@ impl Observer {
         let generation = Arc::new(Mutex::new(0));
         let notices = generation.clone();
         let block = RcBlock::new(move |_: NonNull<NSNotification>| read_domains(changes.clone(), notices.clone()));
-        let domain_name = notification_name(c"NSFileProviderDomainDidChange");
+        let supported = system_supports_file_provider();
+        let domain_name = supported
+            .then(|| notification_name(c"NSFileProviderDomainDidChange"))
+            .flatten();
         // SAFETY: framework-provided notification name, no queue affinity; the
         // block captures only a sendable watch sender. Register before the read
         // that enables domain notifications so changes cannot be missed. A
@@ -89,7 +127,9 @@ impl Observer {
                 crate::cache::changed(root);
             }
         });
-        let materialized_name = notification_name(c"NSFileProviderMaterializedSetDidChange");
+        let materialized_name = supported
+            .then(|| notification_name(c"NSFileProviderMaterializedSetDidChange"))
+            .flatten();
         // SAFETY: framework-provided notification name; the block only accesses
         // thread-safe cache state and has no queue affinity. The center copies it.
         let cache_token = materialized_name.map(|name| unsafe {
@@ -100,7 +140,11 @@ impl Observer {
                 &cache_block,
             )
         });
-        read_domains(sender.clone(), generation.clone());
+        if supported {
+            read_domains(sender.clone(), generation.clone());
+        } else {
+            sender.send_replace(Some(Err("File Provider requires macOS 11 or later".into())));
+        }
         Self {
             cache_token,
             token,
@@ -149,6 +193,10 @@ impl Drop for Observer {
 }
 
 fn read_domains(sender: watch::Sender<Option<Status>>, generation: Arc<Mutex<u64>>) {
+    if !system_supports_file_provider() {
+        sender.send_replace(Some(Err("File Provider requires macOS 11 or later".into())));
+        return;
+    }
     let revision = {
         let mut latest = generation.lock().unwrap();
         *latest += 1;
